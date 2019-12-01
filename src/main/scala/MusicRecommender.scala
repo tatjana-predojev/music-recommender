@@ -1,14 +1,15 @@
 
-package musicrecommender
-
+import org.apache.log4j.{Level, Logger}
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
+import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
 import org.apache.spark.ml.recommendation.{ALS, ALSModel}
 import org.apache.spark.sql.functions._
 
 import scala.collection.Map
 import scala.collection.mutable.ArrayBuffer
-import scala.util.Random
+import scala.util.{Failure, Random, Success, Try}
+
+case class Interaction(user: Int, artist: Int, count: Int)
 
 object MusicRecommender extends App {
 
@@ -19,17 +20,20 @@ object MusicRecommender extends App {
     .getOrCreate()
   import spark.implicits._
 
+  Logger.getRootLogger.setLevel(Level.WARN)
+  //spark.sparkContext.setLogLevel("ERROR")
+
   val base = "/home/tatjana/code/spark/datasets/audioscrobbler-2005/"
   val rawUserArtistData = spark.read.textFile(base + "user_artist_data.txt")
   val rawArtistData = spark.read.textFile(base + "artist_data.txt")
   val rawArtistAlias = spark.read.textFile(base + "artist_alias.txt")
 
-  preparation(rawUserArtistData, rawArtistData, rawArtistAlias)
+  inspection(rawUserArtistData, rawArtistData, rawArtistAlias)
   model(rawUserArtistData, rawArtistData, rawArtistAlias)
-  evaluate(rawUserArtistData, rawArtistAlias)
-  recommend(rawUserArtistData, rawArtistData, rawArtistAlias)
+  //evaluate(rawUserArtistData, rawArtistAlias)
+  //recommend(rawUserArtistData, rawArtistData, rawArtistAlias)
 
-  def preparation(rawUserArtistData: Dataset[String],
+  def inspection(rawUserArtistData: Dataset[String],
                   rawArtistData: Dataset[String],
                   rawArtistAlias: Dataset[String]): Unit = {
 
@@ -55,9 +59,11 @@ object MusicRecommender extends App {
 
     val bArtistAlias = spark.sparkContext.broadcast(buildArtistAlias(rawArtistAlias))
 
-    val trainData = buildCounts(rawUserArtistData, bArtistAlias).cache()
+    val data = buildCounts(rawUserArtistData, bArtistAlias).cache()
 
-    val model = new ALS().
+    val Array(train, test) = data.randomSplit(Array(0.8, 0.2))
+
+    val als = new ALS().
       setSeed(Random.nextLong()).
       setImplicitPrefs(true).
       setRank(10).
@@ -67,35 +73,81 @@ object MusicRecommender extends App {
       setUserCol("user").
       setItemCol("artist").
       setRatingCol("count").
-      setPredictionCol("prediction").
-      fit(trainData)
+      setPredictionCol("prediction")
 
-    model.save("music-model-1")
+    val model = als.fit(train)
+    //model.save("music-model-2")
+    //val model = ALSModel.load("music-model-2")
 
-    trainData.unpersist()
+    train.unpersist()
 
     model.userFactors.select("features").show(truncate = false)
 
-    val userID = 2093760
+    // quick sanity check for a random user
+//    val userID = 2093760
+//    // 2030067, 1024631, 1059334
+//
+//    val existingArtistIDs = train.
+//      filter($"user" === userID).
+//      select("artist").as[Int].collect()
+//
+//    val artistByID = buildArtistByID(rawArtistData)
+//
+//    println("Artists user listened")
+//    artistByID.filter($"id" isin (existingArtistIDs:_*)).show()
+//
+//    val users = train.filter($"user" === userID)
+//    val userRecs: DataFrame = model.recommendForUserSubset(users, 5)
+//    userRecs.show(truncate = false)
+//
+//    val recommendedations = userRecs.select("recommendations").as[Array[(Int, Float)]].collect()
+//    val recommendedArtistIDs = recommendedations(0).map(_._1)
+//
+//    println("Artists recommended")
+//    artistByID.filter($"id" isin (recommendedArtistIDs:_*)).show()
 
-    val existingArtistIDs = trainData.
-      filter($"user" === userID).
-      select("artist").as[Int].collect()
+    val nRecommendations: Int = 10
+    val testUsers = test.select($"user").distinct().limit(3)
+    val recommendations = model.recommendForUserSubset(testUsers, nRecommendations)
+    recommendations.show(10, truncate = false)
+    println("Reccommendations size " + recommendations.count())
+    val groundTruth = test
+      .withColumn("actual", struct("count", "artist"))
+      .groupBy($"user")
+      .agg(slice(sort_array(collect_list($"actual").as("actual"), asc=false), 1, nRecommendations))
+    val groundTruthArtists = groundTruth.map { case Row(user, actual: Array[(Int, Int)]) =>
+      (user, actual.map(_._2)) }.toDF("user", "actual")
+    groundTruth.show(10, truncate = false)
+    groundTruthArtists.show(10, truncate = false)
+    println("Ground truth size " + groundTruth.count())
 
-    val artistByID = buildArtistByID(rawArtistData)
+    val relevantArtists = groundTruth.join(recommendations, usingColumn = "user")
+    relevantArtists.show(10, truncate = false)
+    println("Relevant artists " + relevantArtists.count())
 
-    artistByID.filter($"id" isin (existingArtistIDs:_*)).show()
 
-    val topRecommendations = makeRecommendations(model, userID, 5)
-    topRecommendations.show()
+//
+//    val relevantDocuments = userMovies.join(userRecommended).map { case (user, (actual,
+//    predictions)) =>
+//      (predictions.map(_.product), actual.filter(_.rating > 0.0).map(_.product).toArray)
+//    }
 
-    val recommendedArtistIDs = topRecommendations.select("artist").as[Int].collect()
 
-    artistByID.filter($"id" isin (recommendedArtistIDs:_*)).show()
 
-    model.userFactors.unpersist()
-    model.itemFactors.unpersist()
+    // https://stackoverflow.com/questions/37975715/rankingmetrics-in-spark-scala
+//    val predictions = model.setPredictionCol("prediction").transform(test)
+//    //predictions.take(10).foreach(println)
+//
+//    val testCountCol: Array[Int] = test.select("count").collect().map(_.getInt(0))
+//    val testPredictionCol: Array[Float] = predictions.select("prediction").collect().map(_.getFloat(0))
+//    val metrics: RDD[(Array[Float], Array[Int])] = spark.createDataset(List((testPredictionCol, testCountCol))).rdd
+//    val rm = new RankingMetrics[Float](metrics)
+//    println(s"Mean-average-precision = ${rm.meanAveragePrecision}")
   }
+
+//  def truncateArray(toSize: Int) = udf { array: Seq[Row] =>
+//    array.map(a => if (a.size < toSize) a else a.)
+//  }
 
   def evaluate(rawUserArtistData: Dataset[String],
                rawArtistAlias: Dataset[String]): Unit = {
@@ -109,36 +161,6 @@ object MusicRecommender extends App {
 
     val allArtistIDs = allData.select("artist").as[Int].distinct().collect()
     val bAllArtistIDs = spark.sparkContext.broadcast(allArtistIDs)
-
-    val mostListenedAUC = areaUnderCurve(cvData, bAllArtistIDs, predictMostListened(trainData))
-    println(mostListenedAUC)
-
-    val evaluations =
-      for (rank     <- Seq(5,  30);
-           regParam <- Seq(1.0, 0.0001);
-           alpha    <- Seq(1.0, 40.0))
-        yield {
-          val model = new ALS().
-            setSeed(Random.nextLong()).
-            setImplicitPrefs(true).
-            setRank(rank).setRegParam(regParam).
-            setAlpha(alpha).setMaxIter(20).
-            setUserCol("user").setItemCol("artist").
-            setRatingCol("count").setPredictionCol("prediction").
-            fit(trainData)
-
-          val auc = areaUnderCurve(cvData, bAllArtistIDs, model.transform)
-
-          model.userFactors.unpersist()
-          model.itemFactors.unpersist()
-
-          (auc, (rank, regParam, alpha))
-        }
-
-    evaluations.sorted.reverse.foreach(println)
-
-    trainData.unpersist()
-    cvData.unpersist()
   }
 
   def recommend(rawUserArtistData: Dataset[String],
@@ -172,15 +194,11 @@ object MusicRecommender extends App {
     // span splits this sequence into a prefix/suffix pair according to a predicate
     rawArtistData.flatMap { line =>
       val (id, name) = line.span(_ != '\t')
-      if (name.isEmpty) {
-        None
-      } else {
-        try {
-          Some((id.toInt, name.trim))
-        } catch {
-          case _: NumberFormatException => None
-        }
+      val maybePair = Try((id.toInt, name.trim)) match {
+        case Success((id, name)) => Some((id, name))
+        case Failure(_) => None
       }
+      maybePair.filter { case (_, name) => !name.isEmpty }
     }.toDF("id", "name")
   }
 
@@ -196,12 +214,12 @@ object MusicRecommender extends App {
   }
 
   def buildCounts(rawUserArtistData: Dataset[String],
-                  bArtistAlias: Broadcast[Map[Int,Int]]): DataFrame = {
+                  bArtistAlias: Broadcast[Map[Int,Int]]): Dataset[Interaction] = {
     rawUserArtistData.map { line =>
       val Array(userID, artistID, count) = line.split(' ').map(_.toInt)
       val finalArtistID = bArtistAlias.value.getOrElse(artistID, artistID)
-      (userID, finalArtistID, count)
-    }.toDF("user", "artist", "count")
+      Interaction(userID, finalArtistID, count)
+    }
   }
 
   def makeRecommendations(model: ALSModel, userID: Int, howMany: Int): DataFrame = {

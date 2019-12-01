@@ -3,6 +3,7 @@ import org.apache.log4j.{Level, Logger}
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
 import org.apache.spark.ml.recommendation.{ALS, ALSModel}
+import org.apache.spark.mllib.evaluation.RankingMetrics
 import org.apache.spark.sql.functions._
 
 import scala.collection.Map
@@ -10,6 +11,8 @@ import scala.collection.mutable.ArrayBuffer
 import scala.util.{Failure, Random, Success, Try}
 
 case class Interaction(user: Int, artist: Int, count: Int)
+case class RankingHelper(user: Int, actual: Array[(Int, Int)], recommendations: Array[(Int, Float)])
+case class RankingLabels(actual: Array[Int], recommendations: Array[Int])
 
 object MusicRecommender extends App {
 
@@ -114,40 +117,27 @@ object MusicRecommender extends App {
     val groundTruth = test
       .withColumn("actual", struct("count", "artist"))
       .groupBy($"user")
-      .agg(slice(sort_array(collect_list($"actual").as("actual"), asc=false), 1, nRecommendations))
-    val groundTruthArtists = groundTruth.map { case Row(user, actual: Array[(Int, Int)]) =>
-      (user, actual.map(_._2)) }.toDF("user", "actual")
+      .agg(slice(sort_array(collect_list($"actual"), asc=false), 1, nRecommendations).as("actual"))
     groundTruth.show(10, truncate = false)
-    groundTruthArtists.show(10, truncate = false)
     println("Ground truth size " + groundTruth.count())
+    println("Column types")
+    println(groundTruth.dtypes)
+    println(recommendations.dtypes)
+
+    // this works: figure out the final data structure needed for RankingMetrics and
+    // convert the final relevantArtists to Dataset with appropriate RankHelper type
+    //val groundTruthArtists = groundTruth.as[RankHelper].map(r => r.ranking.map(_._2))
+    //groundTruthArtists.show(10, truncate = false)
 
     val relevantArtists = groundTruth.join(recommendations, usingColumn = "user")
     relevantArtists.show(10, truncate = false)
     println("Relevant artists " + relevantArtists.count())
+    val labels: Dataset[RankingLabels] = relevantArtists.as[RankingHelper].map(r =>
+      RankingLabels(r.actual.map(_._2), r.recommendations.map(_._1)))
+    val metrics = new RankingMetrics(labels.as[(Array[Int], Array[Int])].rdd)
+    println("Precision " + metrics.precisionAt(5))
 
-
-//
-//    val relevantDocuments = userMovies.join(userRecommended).map { case (user, (actual,
-//    predictions)) =>
-//      (predictions.map(_.product), actual.filter(_.rating > 0.0).map(_.product).toArray)
-//    }
-
-
-
-    // https://stackoverflow.com/questions/37975715/rankingmetrics-in-spark-scala
-//    val predictions = model.setPredictionCol("prediction").transform(test)
-//    //predictions.take(10).foreach(println)
-//
-//    val testCountCol: Array[Int] = test.select("count").collect().map(_.getInt(0))
-//    val testPredictionCol: Array[Float] = predictions.select("prediction").collect().map(_.getFloat(0))
-//    val metrics: RDD[(Array[Float], Array[Int])] = spark.createDataset(List((testPredictionCol, testCountCol))).rdd
-//    val rm = new RankingMetrics[Float](metrics)
-//    println(s"Mean-average-precision = ${rm.meanAveragePrecision}")
   }
-
-//  def truncateArray(toSize: Int) = udf { array: Seq[Row] =>
-//    array.map(a => if (a.size < toSize) a else a.)
-//  }
 
   def evaluate(rawUserArtistData: Dataset[String],
                rawArtistAlias: Dataset[String]): Unit = {

@@ -67,6 +67,7 @@ object MusicRecommender extends App {
   quickRecommendationCheck(1059334)
 
   val nRecommendations: Int = 10
+  // recommend for all test users to calculate precision
   val testUsers = test.select($"user").distinct().limit(10)
   model.setColdStartStrategy("drop")
   val recommendations = model.recommendForUserSubset(testUsers, nRecommendations)

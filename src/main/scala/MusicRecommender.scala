@@ -1,14 +1,12 @@
 
 import org.apache.log4j.{Level, Logger}
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
+import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
 import org.apache.spark.ml.recommendation.{ALS, ALSModel}
 import org.apache.spark.mllib.evaluation.RankingMetrics
-import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.functions._
 
 import scala.collection.Map
-import scala.collection.mutable.ArrayBuffer
 import scala.util.{Failure, Random, Success, Try}
 
 case class Interaction(user: Int, artist: Int, count: Int)
@@ -68,9 +66,13 @@ object MusicRecommender extends App {
 
   val nRecommendations: Int = 10
   // recommend for all test users to calculate precision
-  val testUsers = test.select($"user").distinct().limit(10)
+  val testUsers: Dataset[Int] = test.select($"user").distinct().as[Int]
   model.setColdStartStrategy("drop")
-  val recommendations = model.recommendForUserSubset(testUsers, nRecommendations)
+  // recommendForAllUsers a lot quicker than recommendForUserSubset
+  //val recommendations = model.recommendForUserSubset(testUsers, nRecommendations)
+  val recommendationsAll = model.recommendForAllUsers(nRecommendations)
+  //val recommendations = recommendationsAll.filter($"userId" isin testUsers.collect())
+  val recommendations = recommendationsAll.join(testUsers, usingColumn = "user")
   recommendations.show(10, truncate = false)
   println("Reccommendations size " + recommendations.count())
   val groundTruth = test
